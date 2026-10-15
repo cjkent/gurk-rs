@@ -1,5 +1,7 @@
 //! Input box
 
+use std::ops::Range;
+
 use unicode_width::UnicodeWidthStr;
 
 use crate::cursor::Cursor;
@@ -12,6 +14,11 @@ pub struct Input {
     /// Original partial that started a tab-completion cycle (e.g., "th" for thumbsup).
     /// Set during cycling, cleared on any other input action.
     pub completion_partial: Option<String>,
+    /// Names of the people that can be mentioned in this input.
+    ///
+    /// A mention (`@name`) that matches one of these names in full is moved over and deleted as a
+    /// unit.
+    pub mention_names: Vec<String>,
 }
 
 impl Input {
@@ -25,10 +32,12 @@ impl Input {
 
     pub fn on_left(&mut self) {
         self.cursor.move_left(&self.data);
+        self.snap_out_of_mention(true);
     }
 
     pub fn on_right(&mut self) {
         self.cursor.move_right(&self.data);
+        self.snap_out_of_mention(false);
     }
 
     pub fn move_line_down(&mut self) {
@@ -41,10 +50,12 @@ impl Input {
 
     pub fn move_back_word(&mut self) {
         self.cursor.move_word_left(&self.data);
+        self.snap_out_of_mention(true);
     }
 
     pub fn move_forward_word(&mut self) {
         self.cursor.move_word_right(&self.data);
+        self.snap_out_of_mention(false);
     }
 
     pub fn on_home(&mut self) {
@@ -56,11 +67,21 @@ impl Input {
     }
 
     pub fn on_backspace(&mut self) {
-        self.cursor.delete_backward(&mut self.data);
+        if !self.delete_mention_before_cursor() {
+            self.cursor.delete_backward(&mut self.data);
+        }
     }
 
     pub fn on_delete(&mut self) {
-        self.cursor.delete_forward(&mut self.data);
+        let idx = self.cursor.idx;
+        let span = self
+            .mention_spans()
+            .into_iter()
+            .find(|span| span.start <= idx && idx < span.end);
+        match span {
+            Some(span) => self.delete_mention(span),
+            None => self.cursor.delete_forward(&mut self.data),
+        }
     }
 
     pub fn on_delete_line(&mut self) {
@@ -68,7 +89,9 @@ impl Input {
     }
 
     pub fn on_delete_word(&mut self) {
-        self.cursor.delete_word_backward(&mut self.data);
+        if !self.delete_mention_before_cursor() {
+            self.cursor.delete_word_backward(&mut self.data);
+        }
     }
 
     pub fn on_delete_suffix(&mut self) {
@@ -192,6 +215,108 @@ impl Input {
         true
     }
 
+    /// Returns the byte ranges of the mentions in the input.
+    ///
+    /// A mention is an `@` at the beginning of the input or after whitespace, followed by one of
+    /// the `mention_names` in full, ignoring case. The name must end at a word boundary. Text that
+    /// is still the start of a longer name is not a mention yet. This is derived from the text, so
+    /// it holds for names that were typed in full as well as for names completed with tab.
+    pub fn mention_spans(&self) -> Vec<Range<usize>> {
+        let mut spans = Vec::new();
+        if self.mention_names.is_empty() {
+            return spans;
+        }
+        let mut pos = 0;
+        while let Some(offset) = self.data[pos..].find('@') {
+            let at_pos = pos + offset;
+            pos = at_pos + 1;
+            if self.data[..at_pos]
+                .chars()
+                .next_back()
+                .is_some_and(|prev| !prev.is_whitespace())
+            {
+                continue;
+            }
+            if let Some(len) = self.mention_len(&self.data[pos..]) {
+                spans.push(at_pos..pos + len);
+                pos += len;
+            }
+        }
+        spans
+    }
+
+    /// Returns the length in bytes of the longest mentioned name at the start of `text`.
+    fn mention_len(&self, text: &str) -> Option<usize> {
+        let (name, len) = self
+            .mention_names
+            .iter()
+            .filter_map(|name| Some((name, prefix_len_ignore_case(text, name)?)))
+            .filter(|(_, len)| {
+                text[*len..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !next.is_alphanumeric())
+            })
+            .max_by_key(|(_, len)| *len)?;
+
+        // At the end of the input a longer name may still be being typed.
+        let still_typing = len == text.len()
+            && self.mention_names.iter().any(|other| {
+                other.chars().count() > name.chars().count()
+                    && prefix_len_ignore_case(other, text).is_some()
+            });
+        (!still_typing).then_some(len)
+    }
+
+    /// Deletes the name of the mention that ends at the cursor, or that the cursor is inside.
+    fn delete_mention_before_cursor(&mut self) -> bool {
+        let idx = self.cursor.idx;
+        let span = self
+            .mention_spans()
+            .into_iter()
+            .find(|span| span.start < idx && idx <= span.end);
+        match span {
+            Some(span) => {
+                self.delete_mention(span);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Deletes the name of a mention and keeps its `@`, so that another person can be chosen.
+    fn delete_mention(&mut self, span: Range<usize>) {
+        let name = span.start + 1..span.end;
+        let idx = self.cursor.idx.clamp(name.start, name.end);
+        let width_before_cursor = self.data[name.start..idx].width();
+        self.data.replace_range(name.clone(), "");
+        self.cursor = Cursor::new(
+            self.cursor.idx.min(name.start),
+            self.cursor.line,
+            self.cursor.col.saturating_sub(width_before_cursor),
+        );
+    }
+
+    /// Moves the cursor out of a mention it has been moved into, to its start or to its end.
+    fn snap_out_of_mention(&mut self, towards_start: bool) {
+        let idx = self.cursor.idx;
+        let Some(span) = self
+            .mention_spans()
+            .into_iter()
+            .find(|span| span.start < idx && idx < span.end)
+        else {
+            return;
+        };
+        let (new_idx, col) = if towards_start {
+            let width = self.data[span.start..idx].width();
+            (span.start, self.cursor.col.saturating_sub(width))
+        } else {
+            let width = self.data[idx..span.end].width();
+            (span.end, self.cursor.col + width)
+        };
+        self.cursor = Cursor::new(new_idx, self.cursor.line, col);
+    }
+
     /// Returns the byte position of the `@` that starts a mention before the cursor.
     ///
     /// The `@` must be at the beginning of the input or preceded by whitespace, so email addresses
@@ -266,6 +391,20 @@ impl Input {
         self.completion_partial = Some(partial);
         true
     }
+}
+
+/// Returns the length in bytes of the start of `text` that equals `prefix`, ignoring case.
+///
+/// Returns `None` if `text` does not start with `prefix`.
+fn prefix_len_ignore_case(text: &str, prefix: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    for prefix_char in prefix.chars() {
+        let (_, text_char) = chars.next()?;
+        if !text_char.to_lowercase().eq(prefix_char.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(chars.next().map_or(text.len(), |(idx, _)| idx))
 }
 
 #[cfg(test)]
@@ -576,5 +715,120 @@ mod tests {
         assert!(input.try_complete_emoji());
         assert!(!input.try_complete_mention(&names(&["Alexi"])));
         assert_eq!(input.completion_partial.as_deref(), Some("dog"));
+    }
+
+    fn input_with_names(text: &str, mention_names: &[&str]) -> Input {
+        let mut input = Input {
+            mention_names: names(mention_names),
+            ..Default::default()
+        };
+        put_str(&mut input, text);
+        input
+    }
+
+    #[test]
+    fn test_mention_spans() {
+        let input = input_with_names("hi @Bob Dob, and @alexi!", &["Bob Dob", "Alexi"]);
+        assert_eq!(input.mention_spans(), vec![3..11, 17..23]);
+    }
+
+    #[test]
+    fn test_mention_spans_require_word_boundaries() {
+        // `@` inside a word, and a name that is only the start of a longer word.
+        assert!(
+            input_with_names("me@Bob", &["Bob"])
+                .mention_spans()
+                .is_empty()
+        );
+        assert!(
+            input_with_names("@Bobby", &["Bob"])
+                .mention_spans()
+                .is_empty()
+        );
+        // A shorter name is used when the longer one does not fit.
+        let input = input_with_names("@Bob Dobson", &["Bob", "Bob Dob"]);
+        assert_eq!(input.mention_spans(), vec![0..4]);
+    }
+
+    #[test]
+    fn test_mention_spans_wait_for_longer_name() {
+        // At the end of the input "@Bob" may become "@Bob Dob".
+        let names = ["Bob", "Bob Dob"];
+        assert!(input_with_names("@Bob", &names).mention_spans().is_empty());
+        assert_eq!(
+            input_with_names("@Bob ", &names).mention_spans(),
+            vec![0..4]
+        );
+        assert_eq!(
+            input_with_names("@Bob Dob", &names).mention_spans(),
+            vec![0..8]
+        );
+    }
+
+    #[test]
+    fn test_backspace_deletes_whole_name_but_not_the_at() {
+        // typed in full, in a different case than the name
+        let mut input = input_with_names("hi @bob dob", &["Bob Dob"]);
+        input.on_backspace();
+        assert_eq!(input.data, "hi @");
+        assert_eq!(input.cursor, Cursor::new(4, 0, 4));
+        // the `@` is no longer a mention, so the next backspace deletes it
+        input.on_backspace();
+        assert_eq!(input.data, "hi ");
+
+        // completed with tab
+        let mut input = input_with_names("hi @bob d", &["Bob Dob"]);
+        assert!(input.try_complete_mention(&input.mention_names.clone()));
+        assert_eq!(input.data, "hi @Bob Dob");
+        input.on_backspace();
+        assert_eq!(input.data, "hi @");
+    }
+
+    #[test]
+    fn test_backspace_edits_normally_outside_mentions() {
+        let mut input = input_with_names("@Bob", &["Bob", "Bob Dob"]);
+        input.on_backspace();
+        assert_eq!(input.data, "@Bo");
+
+        let mut input = input_with_names("@Bob Dob x", &["Bob Dob"]);
+        input.on_backspace();
+        assert_eq!(input.data, "@Bob Dob ");
+    }
+
+    #[test]
+    fn test_delete_removes_whole_name_but_not_the_at() {
+        let mut input = input_with_names("@Bob Dob x", &["Bob Dob"]);
+        input.on_home();
+        input.on_delete();
+        assert_eq!(input.data, "@ x");
+        assert_eq!(input.cursor, Cursor::new(0, 0, 0));
+    }
+
+    #[test]
+    fn test_cursor_moves_over_mention() {
+        let mut input = input_with_names("@Bob Dob x", &["Bob Dob"]);
+        input.on_home();
+        input.on_right();
+        assert_eq!(input.cursor, Cursor::new(8, 0, 8));
+        input.on_left();
+        assert_eq!(input.cursor, Cursor::new(0, 0, 0));
+    }
+
+    #[test]
+    fn test_word_movement_does_not_stop_inside_mention() {
+        let mut input = input_with_names("@Bob Dob hello", &["Bob Dob"]);
+        input.move_back_word();
+        assert_eq!(input.cursor.idx, 9);
+        input.move_back_word();
+        assert_eq!(input.cursor.idx, 0);
+        input.move_forward_word();
+        assert_eq!(input.cursor.idx, 8);
+    }
+
+    #[test]
+    fn test_delete_word_removes_whole_name_but_not_the_at() {
+        let mut input = input_with_names("x @Bob Dob", &["Bob Dob"]);
+        input.on_delete_word();
+        assert_eq!(input.data, "x @");
     }
 }

@@ -13,7 +13,6 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    #[cfg(test)]
     pub fn new(idx: usize, line: usize, col: usize) -> Self {
         Self {
             idx,

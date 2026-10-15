@@ -132,7 +132,10 @@ impl App {
         let mut names = Vec::new();
         for member in members.into_iter().filter(|id| *id != self.user_id) {
             let name = self.name_by_id(member).await;
-            if !name.trim().is_empty() && Uuid::parse_str(&name) != Ok(member) {
+            if !name.trim().is_empty()
+                && !name.contains('\n')
+                && Uuid::parse_str(&name) != Ok(member)
+            {
                 names.push(name);
             }
         }
@@ -142,8 +145,12 @@ impl App {
     }
 
     pub async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // Keep the names up to date before editing, so that mentions are edited as a unit.
+        if !self.select_channel.is_shown && self.input.data.contains('@') {
+            self.input.mention_names = self.mention_candidates().await;
+        }
         if key.code == KeyCode::Tab && !self.select_channel.is_shown && self.input.in_mention() {
-            let candidates = self.mention_candidates().await;
+            let candidates = self.input.mention_names.clone();
             if self.input.try_complete_mention(&candidates) {
                 return Ok(());
             }
