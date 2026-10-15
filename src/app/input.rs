@@ -11,6 +11,7 @@ use image::codecs::png::PngEncoder;
 use image::{ImageBuffer, ImageEncoder, Rgba};
 use presage::libsignal_service::sender::AttachmentSpec;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::command::{
     Command, DirectionVertical, MoveAmountText, MoveAmountVisual, MoveDirection, Widget, WindowMode,
@@ -116,7 +117,37 @@ impl App {
         Ok(())
     }
 
+    /// Names of the other members of the selected group, for completing `@mentions`.
+    ///
+    /// Members whose name is not known, and so would resolve to their UUID, are left out.
+    async fn mention_candidates(&self) -> Vec<String> {
+        let Some(members) = self
+            .selected_channel()
+            .and_then(|channel| channel.group_data.as_ref())
+            .map(|group_data| group_data.members.clone())
+        else {
+            return Vec::new();
+        };
+
+        let mut names = Vec::new();
+        for member in members.into_iter().filter(|id| *id != self.user_id) {
+            let name = self.name_by_id(member).await;
+            if !name.trim().is_empty() && Uuid::parse_str(&name) != Ok(member) {
+                names.push(name);
+            }
+        }
+        names.sort_by_cached_key(|name| name.to_lowercase());
+        names.dedup();
+        names
+    }
+
     pub async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        if key.code == KeyCode::Tab && !self.select_channel.is_shown && self.input.in_mention() {
+            let candidates = self.mention_candidates().await;
+            if self.input.try_complete_mention(&candidates) {
+                return Ok(());
+            }
+        }
         if key.code == KeyCode::Tab
             && !self.select_channel.is_shown
             && self.input.try_complete_emoji()

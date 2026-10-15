@@ -191,6 +191,81 @@ impl Input {
         self.cursor.idx = open_pos + 1 + next.len();
         true
     }
+
+    /// Returns the byte position of the `@` that starts a mention before the cursor.
+    ///
+    /// The `@` must be at the beginning of the input or preceded by whitespace, so email addresses
+    /// are left alone.
+    fn mention_start(&self) -> Option<usize> {
+        let before = self.data.get(..self.cursor.idx)?;
+        let at_pos = before.rfind('@')?;
+        match before[..at_pos].chars().next_back() {
+            Some(prev) if !prev.is_whitespace() => None,
+            _ => Some(at_pos),
+        }
+    }
+
+    /// Returns true if the cursor is inside a potential mention (`@part`).
+    pub fn in_mention(&self) -> bool {
+        self.mention_start().is_some()
+    }
+
+    /// If the cursor is inside a potential mention (`@part`), complete or cycle to the next
+    /// candidate whose name starts with the partial, ignoring case.
+    /// Returns true if a completion was made.
+    pub fn try_complete_mention(&mut self, candidates: &[String]) -> bool {
+        let idx = self.cursor.idx;
+        let Some(at_pos) = self.mention_start() else {
+            return false;
+        };
+
+        let current = &self.data[at_pos + 1..idx];
+        let current_lower = current.to_lowercase();
+
+        // Reuse the original partial while cycling. Otherwise the text after the `@` is the
+        // partial. It can contain spaces, because names do, and it simply fails to match anything
+        // once the cursor is past the end of a name.
+        let partial = match &self.completion_partial {
+            Some(prev)
+                if current_lower.starts_with(&prev.to_lowercase())
+                    || prev.to_lowercase().starts_with(&current_lower) =>
+            {
+                prev.clone()
+            }
+            _ => current.to_string(),
+        };
+        let partial_lower = partial.to_lowercase();
+
+        let matches: Vec<&String> = candidates
+            .iter()
+            .filter(|name| name.to_lowercase().starts_with(&partial_lower))
+            .collect();
+        if matches.is_empty() {
+            return false;
+        }
+
+        let next_idx = match matches
+            .iter()
+            .position(|name| name.to_lowercase() == current_lower)
+        {
+            Some(i) => (i + 1) % matches.len(),
+            None => 0,
+        };
+        let next = matches[next_idx].clone();
+
+        let old_width = current.width();
+        let new_width = next.width();
+
+        self.data.replace_range(at_pos + 1..idx, &next);
+        if new_width >= old_width {
+            self.cursor.col += new_width - old_width;
+        } else {
+            self.cursor.col = self.cursor.col.saturating_sub(old_width - new_width);
+        }
+        self.cursor.idx = at_pos + 1 + next.len();
+        self.completion_partial = Some(partial);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -385,5 +460,121 @@ mod tests {
         assert!(!input.try_complete_emoji());
         assert_eq!(input.data, "");
         assert_eq!(input.completion_partial, None);
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn test_complete_mention_unique_match() {
+        // The partial is matched ignoring case and completed to the full name.
+        let mut input = Input::default();
+        put_str(&mut input, "hi @al");
+        assert!(input.try_complete_mention(&names(&["Alexi", "Bob"])));
+        assert_eq!(input.data, "hi @Alexi");
+        assert_eq!(input.cursor, Cursor::new("hi @Alexi".len(), 0, 9));
+        assert_eq!(input.completion_partial.as_deref(), Some("al"));
+    }
+
+    #[test]
+    fn test_complete_mention_cycles_matches() {
+        let mut input = Input::default();
+        put_str(&mut input, "@a");
+        let candidates = names(&["Alexi", "Anna", "Bob"]);
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Alexi");
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Anna");
+        // Cycling wraps back around to the first match.
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Alexi");
+        assert_eq!(input.completion_partial.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_complete_mention_empty_partial_lists_everyone() {
+        let mut input = Input::default();
+        put_str(&mut input, "@");
+        let candidates = names(&["Alexi", "Bob"]);
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Alexi");
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Bob");
+    }
+
+    #[test]
+    fn test_complete_mention_name_with_space_cycles() {
+        // A completed name containing a space is still recognised as part of the cycle.
+        let mut input = Input::default();
+        put_str(&mut input, "@m");
+        let candidates = names(&["Mary Jane", "Mike"]);
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Mary Jane");
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Mike");
+    }
+
+    #[test]
+    fn test_complete_mention_partial_with_space() {
+        // A partial can run past the first word of a name.
+        let mut input = Input::default();
+        put_str(&mut input, "hi @bob d");
+        let candidates = names(&["Bob Dob", "Bob Smith"]);
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "hi @Bob Dob");
+        assert_eq!(input.completion_partial.as_deref(), Some("bob d"));
+
+        // A trailing space after the first name matches both people, so it cycles.
+        let mut input = Input::default();
+        put_str(&mut input, "@bob ");
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Bob Dob");
+        assert!(input.try_complete_mention(&candidates));
+        assert_eq!(input.data, "@Bob Smith");
+    }
+
+    #[test]
+    fn test_complete_mention_keeps_text_after_cursor() {
+        let mut input = Input::default();
+        put_str(&mut input, "@al and more");
+        for _ in 0.." and more".len() {
+            input.on_left();
+        }
+        assert!(input.try_complete_mention(&names(&["Alexi"])));
+        assert_eq!(input.data, "@Alexi and more");
+        assert_eq!(input.cursor.idx, "@Alexi".len());
+    }
+
+    #[test]
+    fn test_complete_mention_no_match() {
+        let mut input = Input::default();
+        put_str(&mut input, "@zz");
+        assert!(!input.try_complete_mention(&names(&["Alexi"])));
+        assert_eq!(input.data, "@zz");
+    }
+
+    #[test]
+    fn test_complete_mention_ignores_email_and_plain_text() {
+        let mut input = Input::default();
+        put_str(&mut input, "mail me@al");
+        assert!(!input.in_mention());
+        assert!(!input.try_complete_mention(&names(&["Alexi"])));
+        assert_eq!(input.data, "mail me@al");
+
+        let mut input = Input::default();
+        put_str(&mut input, "@alexi done");
+        assert!(!input.try_complete_mention(&names(&["Alexi"])));
+        assert_eq!(input.data, "@alexi done");
+    }
+
+    #[test]
+    fn test_complete_mention_leaves_emoji_cycle_untouched() {
+        // A failed mention completion must not reset an emoji completion cycle.
+        let mut input = Input::default();
+        put_str(&mut input, ":dog");
+        assert!(input.try_complete_emoji());
+        assert!(!input.try_complete_mention(&names(&["Alexi"])));
+        assert_eq!(input.completion_partial.as_deref(), Some("dog"));
     }
 }
