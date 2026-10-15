@@ -545,11 +545,13 @@ fn display_message(
     let delimiter = Span::from(": ");
 
     // collect message text
+    let mut mentions = Vec::new();
     let mut text = if msg.deleted {
         String::from("[message deleted]")
     } else {
         let text = strip_ansi_escapes::strip_str(msg.message.as_deref().unwrap_or_default());
-        let mut text = replace_mentions(msg, names, text);
+        let (mut text, found) = replace_mentions(msg, names, text);
+        mentions = found;
         add_attachments(msg, &mut text);
         if text.is_empty() {
             return None; // no text => nothing to render
@@ -626,16 +628,12 @@ fn display_message(
             .strip_prefix(&first_line_prefix)
             .expect("logic error")
             .to_owned();
-        spans.push(Line::from(vec![
-            receipt,
-            time,
-            from,
-            delimiter,
-            Span::styled(line, message_style),
-        ]));
+        let mut first_line = vec![receipt, time, from, delimiter];
+        first_line.extend(style_mentions(&line, &mentions, message_style));
+        spans.push(Line::from(first_line));
     }
     spans.extend(
-        wrapped_text.map(|line| Line::from(Span::styled(line.into_owned(), message_style))),
+        wrapped_text.map(|line| Line::from(style_mentions(&line, &mentions, message_style))),
     );
 
     if let Some(reason) = msg.send_failed.as_deref() {
@@ -656,9 +654,19 @@ fn display_message(
     Some(ListItem::new(Text::from(spans)))
 }
 
-fn replace_mentions(msg: &Message, names: &NameResolver, text: String) -> String {
+/// A mention as it appears in the displayed text, and the colour of the mentioned person.
+struct Mention {
+    text: String,
+    color: Color,
+}
+
+/// Replaces the placeholder of every mention in `text` with `@name`.
+///
+/// Spaces in a name are replaced with no-break spaces, so that wrapping the text cannot split a
+/// mention over two lines.
+fn replace_mentions(msg: &Message, names: &NameResolver, text: String) -> (String, Vec<Mention>) {
     if msg.body_ranges.is_empty() {
-        return text;
+        return (text, Vec::new());
     }
 
     let ac = aho_corasick::AhoCorasickBuilder::new()
@@ -666,21 +674,48 @@ fn replace_mentions(msg: &Message, names: &NameResolver, text: String) -> String
         .expect("failed to build obj replacer");
     let mut buf = String::with_capacity(text.len());
     let mut ranges = msg.body_ranges.iter();
+    let mut mentions = Vec::new();
     ac.replace_all_with(&text, &mut buf, |_, _, dst| {
         // TODO: check ranges?
         for range in &mut ranges {
-            let (name, _color) = match range.value {
+            let (name, color) = match range.value {
                 AssociatedValue::MentionUuid(id) => names.resolve(id),
                 AssociatedValue::Style(_) => continue, // not supported yet
             };
-            dst.push('@');
-            dst.push_str(&name);
+            let mention = format!("@{}", name.replace(' ', "\u{a0}"));
+            dst.push_str(&mention);
+            mentions.push(Mention {
+                text: mention,
+                color,
+            });
             return true;
         }
         false
     });
 
-    buf
+    (buf, mentions)
+}
+
+/// Splits `line` into spans, with the mentions in the colour of the mentioned person and in bold.
+fn style_mentions(line: &str, mentions: &[Mention], style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while let Some((pos, mention)) = mentions
+        .iter()
+        .filter_map(|mention| Some((rest.find(&mention.text)?, mention)))
+        .min_by_key(|(pos, mention)| (*pos, std::cmp::Reverse(mention.text.len())))
+    {
+        if pos > 0 {
+            spans.push(Span::styled(rest[..pos].to_owned(), style));
+        }
+        let mention_style = style.fg(mention.color).add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(mention.text.clone(), mention_style));
+        rest = &rest[pos + mention.text.len()..];
+    }
+    if !rest.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(rest.to_owned(), style));
+    }
+    spans
 }
 
 fn display_date_line(
@@ -874,7 +909,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
 fn displayed_quote(names: &NameResolver, quote: &Message) -> Option<String> {
     let (name, _) = names.resolve(quote.from_id);
     let text = format!("({}) {}", name, quote.message.as_ref()?);
-    Some(replace_mentions(quote, names, text))
+    Some(replace_mentions(quote, names, text).0)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1292,9 +1327,25 @@ mod tests {
                 ),
                 Span::styled("boxdot", Style::default().fg(Color::Green)),
                 Span::raw(": "),
-                Span::raw("Mention @boxdot  and even more"),
+                Span::raw("Mention "),
+                Span::styled(
+                    "@boxdot",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  and even more"),
             ]),
-            Line::from(vec![Span::raw("                  @boxdot . End")]),
+            Line::from(vec![
+                Span::raw("                  "),
+                Span::styled(
+                    "@boxdot",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" . End"),
+            ]),
         ]));
         assert_eq!(rendered, Some(expected));
     }
@@ -1374,5 +1425,47 @@ mod tests {
             ]),
         ]));
         assert_eq!(rendered, Some(expected));
+    }
+
+    #[test]
+    fn test_style_mentions() {
+        let mentions = [
+            Mention {
+                text: "@Bob\u{a0}Dob".to_owned(),
+                color: Color::Green,
+            },
+            Mention {
+                text: "@Al".to_owned(),
+                color: Color::Blue,
+            },
+        ];
+        let style = Style::default();
+        let bold = |color| style.fg(color).add_modifier(Modifier::BOLD);
+        assert_eq!(
+            style_mentions("hi @Bob\u{a0}Dob and @Al!", &mentions, style),
+            vec![
+                Span::styled("hi ", style),
+                Span::styled("@Bob\u{a0}Dob", bold(Color::Green)),
+                Span::styled(" and ", style),
+                Span::styled("@Al", bold(Color::Blue)),
+                Span::styled("!", style),
+            ]
+        );
+        assert_eq!(
+            style_mentions("no mentions", &mentions, style),
+            vec![Span::styled("no mentions", style)]
+        );
+        assert_eq!(
+            style_mentions("@Al", &mentions, style),
+            vec![Span::styled("@Al", bold(Color::Blue))]
+        );
+        assert_eq!(style_mentions("", &mentions, style), vec![Span::raw("")]);
+    }
+
+    #[test]
+    fn test_mention_with_space_is_not_wrapped() {
+        let text = "hello @Bob\u{a0}Dob";
+        let lines = textwrap::wrap(text, textwrap::Options::new(12));
+        assert_eq!(lines, vec!["hello", "@Bob\u{a0}Dob"]);
     }
 }
