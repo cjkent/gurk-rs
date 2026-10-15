@@ -64,6 +64,8 @@ pub struct App {
     channel_selected_at: std::time::Instant,
     /// Channel whose message timers have been activated (avoids repeated scanning)
     timers_activated_for: Option<ChannelId>,
+    /// Group and group revision for which the member names have been cached
+    group_names_cached_for: Option<(ChannelId, u32)>,
     /// Points to the next message that will expire
     next_expiring_at: Option<u64>,
     /// The height of the message view in the renderer
@@ -123,6 +125,7 @@ impl App {
             names_cache: Default::default(),
             mode_keybindings,
             channel_selected_at: std::time::Instant::now(),
+            group_names_cached_for: None,
             timers_activated_for: None,
             next_expiring_at,
             message_view_height: 0,
@@ -200,6 +203,29 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Resolve and cache the names of the members of the selected group
+    ///
+    /// Names are drawn from the cache only. Without this, the name of a member who has not sent a
+    /// message since the start is shown as their UUID. Does nothing if the names of the selected
+    /// group and its current revision have been cached already.
+    pub async fn cache_selected_group_names(&mut self) {
+        let Some((channel_id, group_data)) = self
+            .selected_channel()
+            .and_then(|channel| Some((channel.id, channel.group_data.as_ref()?)))
+        else {
+            return;
+        };
+        let cached_for = (channel_id, group_data.revision);
+        if self.group_names_cached_for == Some(cached_for) {
+            return;
+        }
+        let members = group_data.members.clone();
+        for member in members {
+            self.name_by_id(member).await;
+        }
+        self.group_names_cached_for = Some(cached_for);
     }
 
     /// Returns the name of a user by their ID from the cache without resolving it.

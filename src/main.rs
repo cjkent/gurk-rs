@@ -280,6 +280,8 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
     let mut expire_tick_counter: u64 = 0;
 
     loop {
+        app.cache_selected_group_names().await;
+
         // render
         let left_frame_budget = FRAME_BUDGET.checked_sub(last_render_at.elapsed());
         if let Some(budget) = left_frame_budget {
