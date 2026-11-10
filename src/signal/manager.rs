@@ -43,6 +43,7 @@ pub trait SignalManager {
         &self,
         channel: &Channel,
         text: String,
+        mentions: &[Uuid],
         quote_message: Option<&Message>,
         edit_message_timestamp: Option<u64>,
         attachments: Vec<(AttachmentSpec, Vec<u8>)>,

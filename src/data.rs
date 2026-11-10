@@ -255,6 +255,9 @@ pub struct Message {
     pub(crate) expires_at: Option<u64>,
 }
 
+/// Character that stands for a mention in the body of a message.
+pub(crate) const MENTION_PLACEHOLDER: char = '\u{FFFC}';
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BodyRange {
     pub(crate) start: u16,
@@ -322,6 +325,35 @@ impl From<&BodyRange> for proto::BodyRange {
 }
 
 impl BodyRange {
+    /// Returns a mention range for each `MENTION_PLACEHOLDER` in `text`, for the given people in
+    /// order.
+    ///
+    /// Positions are counted in UTF-16 code units, as in the Signal protocol.
+    pub(crate) fn mentions(text: &str, people: &[Uuid]) -> Vec<Self> {
+        let mut ranges = Vec::new();
+        let mut people = people.iter();
+        let mut start = 0;
+        for c in text.chars() {
+            if c == MENTION_PLACEHOLDER {
+                let Some(&id) = people.next() else {
+                    break;
+                };
+                let (Ok(range_start), Ok(range_end)) =
+                    (u16::try_from(start), u16::try_from(start + 1))
+                else {
+                    break;
+                };
+                ranges.push(Self {
+                    start: range_start,
+                    end: range_end,
+                    value: AssociatedValue::MentionUuid(id),
+                });
+            }
+            start += c.len_utf16();
+        }
+        ranges
+    }
+
     pub(crate) fn from_proto(proto: proto::BodyRange) -> Option<Self> {
         let value = match proto.associated_value? {
             proto::body_range::AssociatedValue::MentionAci(uuid) => {
@@ -435,4 +467,41 @@ pub fn parse_uuid(str_field: Option<&str>, binary_field: Option<&[u8]>) -> Optio
         .and_then(ServiceId::parse_from_service_id_binary)
         .map(|sid| sid.raw_uuid())
         .or_else(|| str_field.and_then(|s| s.parse().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mention_body_ranges() {
+        let bob = Uuid::new_v4();
+        let alexi = Uuid::new_v4();
+        // The emoji is two UTF-16 code units long.
+        let text = "hi \u{FFFC} \u{1F436} \u{FFFC}!";
+        let ranges = BodyRange::mentions(text, &[bob, alexi]);
+        assert_eq!(
+            ranges,
+            vec![
+                BodyRange {
+                    start: 3,
+                    end: 4,
+                    value: AssociatedValue::MentionUuid(bob),
+                },
+                BodyRange {
+                    start: 8,
+                    end: 9,
+                    value: AssociatedValue::MentionUuid(alexi),
+                },
+            ]
+        );
+        let proto = proto::BodyRange::from(&ranges[1]);
+        assert_eq!((proto.start, proto.length), (Some(8), Some(1)));
+    }
+
+    #[test]
+    fn test_mention_body_ranges_without_people() {
+        assert!(BodyRange::mentions("\u{FFFC}", &[]).is_empty());
+        assert!(BodyRange::mentions("no mentions", &[Uuid::new_v4()]).is_empty());
+    }
 }

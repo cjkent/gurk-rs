@@ -11,11 +11,12 @@ use image::codecs::png::PngEncoder;
 use image::{ImageBuffer, ImageEncoder, Rgba};
 use presage::libsignal_service::sender::AttachmentSpec;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::command::{
     Command, DirectionVertical, MoveAmountText, MoveAmountVisual, MoveDirection, Widget, WindowMode,
 };
-use crate::data::{ChannelId, Message};
+use crate::data::{AssociatedValue, ChannelId, MENTION_PLACEHOLDER, Message};
 use crate::storage::MessageId;
 use crate::util::{ATTACHMENT_REGEX, URL_REGEX};
 
@@ -59,7 +60,7 @@ impl App {
             Command::BeginningOfLine => self.get_input().on_home(),
             Command::EndOfLine => self.get_input().on_end(),
             Command::EditMessage => {
-                self.start_editing();
+                self.start_editing().await;
             }
             // Command::ReplyMessage => unimplemented!("{command:?}"),
             Command::DeleteMessage => {
@@ -116,7 +117,47 @@ impl App {
         Ok(())
     }
 
+    /// Names and IDs of the other members of the selected group, for `@mentions`.
+    ///
+    /// Members whose name is not known, and so would resolve to their UUID, are left out. Of
+    /// several members with the same name, only one is kept.
+    async fn mention_candidates(&self) -> Vec<(String, Uuid)> {
+        let Some(members) = self
+            .selected_channel()
+            .and_then(|channel| channel.group_data.as_ref())
+            .map(|group_data| group_data.members.clone())
+        else {
+            return Vec::new();
+        };
+
+        let mut names = Vec::new();
+        for member in members.into_iter().filter(|id| *id != self.user_id) {
+            let name = self.name_by_id(member).await;
+            if !name.trim().is_empty()
+                && !name.contains('\n')
+                && Uuid::parse_str(&name) != Ok(member)
+            {
+                names.push((name, member));
+            }
+        }
+        names.sort_by_cached_key(|(name, _)| name.to_lowercase());
+        names.dedup_by(|a, b| a.0 == b.0);
+        names
+    }
+
     pub async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // Keep the names up to date before editing, so that mentions are edited as a unit.
+        if !self.select_channel.is_shown && self.input.data.contains('@') {
+            let candidates = self.mention_candidates().await;
+            self.input.mention_names = candidates.iter().map(|(name, _)| name.clone()).collect();
+            self.mention_ids = candidates.into_iter().collect();
+        }
+        if key.code == KeyCode::Tab && !self.select_channel.is_shown && self.input.in_mention() {
+            let candidates = self.input.mention_names.clone();
+            if self.input.try_complete_mention(&candidates) {
+                return Ok(());
+            }
+        }
         if key.code == KeyCode::Tab
             && !self.select_channel.is_shown
             && self.input.try_complete_emoji()
@@ -275,7 +316,16 @@ impl App {
     }
 
     pub(super) fn send_input(&mut self, channel_id: ChannelId) {
-        let input = self.take_input();
+        let is_group = self
+            .channel(channel_id)
+            .is_some_and(|channel| channel.group_data.is_some());
+        let (input, mentions) = if is_group && !self.select_channel.is_shown {
+            let mention_ids = &self.mention_ids;
+            self.input
+                .take_with_mentions(|name| mention_ids.get(name).copied())
+        } else {
+            (self.take_input(), Vec::new())
+        };
         let (input, attachments) = Self::extract_attachments(&input, Local::now(), || {
             self.clipboard.as_mut().map(|c| c.get_image())
         });
@@ -285,6 +335,7 @@ impl App {
         let (sent_message, response) = self.signal_manager.send_text(
             channel,
             input,
+            &mentions,
             quote.as_deref(),
             editing.map(|id| id.arrived_at),
             attachments,
@@ -336,7 +387,7 @@ impl App {
         is_reset
     }
 
-    fn start_editing(&mut self) -> Option<()> {
+    pub(super) async fn start_editing(&mut self) -> Option<()> {
         if !self.input.is_empty() {
             return None;
         }
@@ -355,6 +406,33 @@ impl App {
             .unwrap_or(message.arrived_at);
         let message_id = MessageId::new(message_id.channel_id, target_sent_timestamp);
         let text = message.message.clone()?;
+
+        // Show the mentions as `@name`, so that they are sent as mentions again.
+        let mut mentioned: Vec<(u16, Uuid)> = message
+            .body_ranges
+            .iter()
+            .filter_map(|range| match range.value {
+                AssociatedValue::MentionUuid(id) => Some((range.start, id)),
+                AssociatedValue::Style(_) => None,
+            })
+            .collect();
+        mentioned.sort_by_key(|(start, _)| *start);
+        let mut names = Vec::new();
+        for (_, id) in mentioned {
+            names.push(self.name_by_id(id).await);
+        }
+        let mut names = names.into_iter();
+        let mut edited = String::with_capacity(text.len());
+        for c in text.chars() {
+            match (c == MENTION_PLACEHOLDER).then(|| names.next()).flatten() {
+                Some(name) => {
+                    edited.push('@');
+                    edited.push_str(&name);
+                }
+                None => edited.push(c),
+            }
+        }
+        let text = edited;
 
         self.editing.replace(message_id);
         self.input.data = text;
