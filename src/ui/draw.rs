@@ -694,7 +694,7 @@ fn display_date_line(
         previous_msg_timestamp.map(|t| utc_timestamp_msec_to_local(t).num_days_from_ce());
 
     if Some(current_msg_day) != previous_msg_day {
-        let date = format!("{:=^width$}", local_time.format(" %A, %x "));
+        let date = format!("{:=^width$}", local_time.format(" %A, %Y/%m/%d "));
         Some(date)
     } else {
         None
