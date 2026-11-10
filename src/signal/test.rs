@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use uuid::Uuid;
 
-use crate::data::{Channel, GroupData, Message};
+use crate::data::{BodyRange, Channel, GroupData, Message};
 use crate::receipt::Receipt;
 use crate::util::utc_now_timestamp_msec;
 
@@ -85,11 +85,13 @@ impl SignalManager for SignalManagerMock {
         &self,
         _channel: &Channel,
         text: String,
+        mentions: &[Uuid],
         quote_message: Option<&Message>,
         _edit_message_timestamp: Option<u64>,
         _attachments: Vec<(AttachmentSpec, Vec<u8>)>,
     ) -> (Message, oneshot::Receiver<anyhow::Result<()>>) {
         let message: String = crate::emoji::replace_shortcodes(&text).into_owned();
+        let body_ranges = BodyRange::mentions(&message, mentions);
         let timestamp = utc_now_timestamp_msec();
         let quote = quote_message.map(|message| Quote {
             id: Some(message.arrived_at),
@@ -106,7 +108,7 @@ impl SignalManager for SignalManagerMock {
             attachments: Default::default(),
             reactions: Default::default(),
             receipt: Receipt::Sent,
-            body_ranges: Default::default(),
+            body_ranges,
             send_failed: Default::default(),
             attachment_downloads: Default::default(),
             edit: Default::default(),

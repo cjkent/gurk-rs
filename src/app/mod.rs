@@ -68,6 +68,8 @@ pub struct App {
     timers_activated_for: Option<ChannelId>,
     /// Points to the next message that will expire
     next_expiring_at: Option<u64>,
+    /// Members of the selected group by name, for sending `@mentions`
+    mention_ids: BTreeMap<String, Uuid>,
     /// The height of the message view in the renderer
     ///
     /// Written by the renderer, used to load enough messages to fill the view
@@ -128,6 +130,7 @@ impl App {
             channel_selected_at: std::time::Instant::now(),
             timers_activated_for: None,
             next_expiring_at,
+            mention_ids: BTreeMap::new(),
             message_view_height: 0,
         };
 
@@ -422,7 +425,7 @@ pub(crate) mod tests {
 
     use arboard::ImageData;
 
-    use crate::data::GroupData;
+    use crate::data::{AssociatedValue, BodyRange, GroupData};
     use crate::signal::GroupMasterKeyBytes;
     use crate::signal::test::SignalManagerMock;
     use crate::{config::User, storage::SqliteStorage};
@@ -566,6 +569,38 @@ pub(crate) mod tests {
             }
             event => panic!("unexpected event: {event:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_input_with_mention() {
+        let (mut app, _events, sent_messages) = test_app().await;
+        let bob = Uuid::new_v4();
+        app.mention_ids = [("Bob Dob".to_string(), bob)].into_iter().collect();
+        app.input.mention_names = vec!["Bob Dob".to_string()];
+        for c in ":dog: hi @bob dob!".chars() {
+            app.get_input().put_char(c);
+        }
+
+        let channel_id = app.channels().first().unwrap().id;
+        app.send_input(channel_id);
+
+        let msg = sent_messages.borrow()[0].clone();
+        assert_eq!(msg.message.as_deref(), Some("\u{1F436} hi \u{FFFC}!"));
+        assert_eq!(
+            msg.body_ranges,
+            vec![BodyRange {
+                start: 6,
+                end: 7,
+                value: AssociatedValue::MentionUuid(bob),
+            }]
+        );
+
+        // Editing the message shows the mention as text again.
+        app.names_cache
+            .replace(Some([(bob, "Bob Dob".to_string())].into_iter().collect()));
+        app.positions.entry(channel_id).or_default().selected = Some(msg.arrived_at);
+        app.start_editing().await.unwrap();
+        assert_eq!(app.input.data, "\u{1F436} hi @Bob Dob!");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -5,6 +5,7 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cursor::Cursor;
+use crate::data::MENTION_PLACEHOLDER;
 
 /// Input box with data and a cursor
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -222,6 +223,56 @@ impl Input {
     /// is still the start of a longer name is not a mention yet. This is derived from the text, so
     /// it holds for names that were typed in full as well as for names completed with tab.
     pub fn mention_spans(&self) -> Vec<Range<usize>> {
+        self.find_mentions(false)
+            .into_iter()
+            .map(|(span, _)| span)
+            .collect()
+    }
+
+    /// Takes the text of the input, with every mention replaced by `MENTION_PLACEHOLDER`, and
+    /// returns the mentioned people in order.
+    ///
+    /// `resolve` returns the person with a mentioned name. A mention whose name cannot be resolved
+    /// is kept as plain text. A placeholder character in the text itself is dropped, so that the
+    /// placeholders and the people stay in step.
+    pub fn take_with_mentions<T>(
+        &mut self,
+        mut resolve: impl FnMut(&str) -> Option<T>,
+    ) -> (String, Vec<T>) {
+        let mentions: Vec<(Range<usize>, String)> = self
+            .find_mentions(true)
+            .into_iter()
+            .map(|(span, name)| (span, name.to_owned()))
+            .collect();
+        let data = self.take();
+
+        let mut text = String::with_capacity(data.len());
+        let mut people = Vec::new();
+        let mut pos = 0;
+        for (span, name) in mentions {
+            text.extend(
+                data[pos..span.start]
+                    .chars()
+                    .filter(|&c| c != MENTION_PLACEHOLDER),
+            );
+            match resolve(&name) {
+                Some(person) => {
+                    text.push(MENTION_PLACEHOLDER);
+                    people.push(person);
+                }
+                None => text.push_str(&data[span.clone()]),
+            }
+            pos = span.end;
+        }
+        text.extend(data[pos..].chars().filter(|&c| c != MENTION_PLACEHOLDER));
+        (text, people)
+    }
+
+    /// Returns the byte range and the mentioned name of each mention in the input.
+    ///
+    /// If `complete` is true, the text is final, so a name at the end of the input is a mention
+    /// even if it is the start of a longer name.
+    fn find_mentions(&self, complete: bool) -> Vec<(Range<usize>, &str)> {
         let mut spans = Vec::new();
         if self.mention_names.is_empty() {
             return spans;
@@ -237,16 +288,17 @@ impl Input {
             {
                 continue;
             }
-            if let Some(len) = self.mention_len(&self.data[pos..]) {
-                spans.push(at_pos..pos + len);
+            if let Some((len, name)) = self.mention_len(&self.data[pos..], complete) {
+                spans.push((at_pos..pos + len, name));
                 pos += len;
             }
         }
         spans
     }
 
-    /// Returns the length in bytes of the longest mentioned name at the start of `text`.
-    fn mention_len(&self, text: &str) -> Option<usize> {
+    /// Returns the length in bytes and the name of the longest mentioned name at the start of
+    /// `text`.
+    fn mention_len(&self, text: &str, complete: bool) -> Option<(usize, &str)> {
         let (name, len) = self
             .mention_names
             .iter()
@@ -260,12 +312,13 @@ impl Input {
             .max_by_key(|(_, len)| *len)?;
 
         // At the end of the input a longer name may still be being typed.
-        let still_typing = len == text.len()
+        let still_typing = !complete
+            && len == text.len()
             && self.mention_names.iter().any(|other| {
                 other.chars().count() > name.chars().count()
                     && prefix_len_ignore_case(other, text).is_some()
             });
-        (!still_typing).then_some(len)
+        (!still_typing).then_some((len, name.as_str()))
     }
 
     /// Deletes the name of the mention that ends at the cursor, or that the cursor is inside.
@@ -830,5 +883,42 @@ mod tests {
         let mut input = input_with_names("x @Bob Dob", &["Bob Dob"]);
         input.on_delete_word();
         assert_eq!(input.data, "x @");
+    }
+
+    #[test]
+    fn test_take_with_mentions() {
+        let mut input = input_with_names("hi @bob dob and @Alexi", &["Bob Dob", "Alexi"]);
+        let (text, people) = input.take_with_mentions(|name| Some(name.to_owned()));
+        assert_eq!(text, "hi \u{FFFC} and \u{FFFC}");
+        assert_eq!(people, vec!["Bob Dob", "Alexi"]);
+        assert_eq!(input.data, "");
+        assert_eq!(input.cursor, Cursor::default());
+    }
+
+    #[test]
+    fn test_take_with_mentions_name_at_end_is_complete() {
+        // While typing, "@Bob" could still become "@Bob Dob", but the sent text is final.
+        let mut input = input_with_names("hi @Bob", &["Bob", "Bob Dob"]);
+        assert!(input.mention_spans().is_empty());
+        let (text, people) = input.take_with_mentions(|name| Some(name.to_owned()));
+        assert_eq!(text, "hi \u{FFFC}");
+        assert_eq!(people, vec!["Bob"]);
+    }
+
+    #[test]
+    fn test_take_with_mentions_keeps_unresolved_names() {
+        let mut input = input_with_names("@Bob and @Alexi", &["Bob", "Alexi"]);
+        let (text, people) =
+            input.take_with_mentions(|name| (name == "Alexi").then_some(name.to_owned()));
+        assert_eq!(text, "@Bob and \u{FFFC}");
+        assert_eq!(people, vec!["Alexi"]);
+    }
+
+    #[test]
+    fn test_take_with_mentions_drops_typed_placeholders() {
+        let mut input = input_with_names("a\u{FFFC} @Bob", &["Bob"]);
+        let (text, people) = input.take_with_mentions(|name| Some(name.to_owned()));
+        assert_eq!(text, "a \u{FFFC}");
+        assert_eq!(people, vec!["Bob"]);
     }
 }
